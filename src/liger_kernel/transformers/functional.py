@@ -12,6 +12,8 @@ from liger_kernel.ops.group_norm import LigerGroupNormFunction
 from liger_kernel.ops.jsd import LigerJSDFunction
 from liger_kernel.ops.kl_div import LigerKLDivLossFunction
 from liger_kernel.ops.layer_norm import LigerLayerNormFunction
+from liger_kernel.ops.linear import LigerLinearFunction
+from liger_kernel.ops.mse import LigerMSEFunction
 from liger_kernel.ops.multi_token_attention import LigerMultiTokenAttentionFunction
 from liger_kernel.ops.qwen2vl_mrope import LigerQwen2VLMRopeFunction
 from liger_kernel.ops.relu import LigerReLUFunction
@@ -291,3 +293,11 @@ def liger_gelu(x):
 
 def liger_silu(x):
     return LigerSiLUFunction.apply(x)
+
+
+def liger_linear(x, weight, bias=None):
+    return LigerLinearFunction.apply(x, weight, bias)
+
+
+def liger_mse(y, y_hat, reduction: str = "mean"):
+    return LigerMSEFunction.apply(y, y_hat, reduction)
