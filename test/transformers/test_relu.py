@@ -37,9 +37,6 @@ class LigerReLUMLP(nn.Module):
         return self.down_proj(relu_output)
 
 
-SLEEP_SECONDS = 0.1
-
-
 @pytest.mark.parametrize(
     "bsz, seq_len, hidden_size, intermediate_size",
     [
