@@ -295,8 +295,8 @@ def liger_silu(x):
     return LigerSiLUFunction.apply(x)
 
 
-def liger_linear(x, weight, bias=None):
-    return LigerLinearFunction.apply(x, weight, bias)
+def liger_linear(input_tensor, weight, bias=None):
+    return LigerLinearFunction.apply(input_tensor, weight, bias)
 
 
 def liger_mse(y, y_hat, reduction: str = "mean"):

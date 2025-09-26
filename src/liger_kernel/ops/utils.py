@@ -125,3 +125,47 @@ def element_mul_kernel(
         X_offsets = i + tl.arange(0, BLOCK_SIZE)
         X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols)
         tl.store(X_ptr + X_offsets, X_block * grad_output, mask=X_offsets < n_cols)
+
+@triton.jit
+def elementwise_mul_kernel(
+    A_ptr, A_stride,
+    B_ptr, B_stride,
+    C_ptr, C_stride,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Element-wise multiplication between two matrices A and B of the same size.
+    Stores the result in C.
+
+    Parameters:
+    A_ptr: Pointer to matrix A.
+    A_stride (int): Row stride of A.
+    B_ptr: Pointer to matrix B.
+    B_stride (int): Row stride of B.
+    C_ptr: Pointer to matrix C (output).
+    C_stride (int): Row stride of C.
+    n_cols (int): Number of columns.
+    BLOCK_SIZE (int): Block size for Triton ops.
+    """
+
+    # Each program handles one row
+    row_id = tl.program_id(0).to(tl.int64)
+
+    # Locate row start addresses
+    A_row_ptr = A_ptr + row_id * A_stride
+    B_row_ptr = B_ptr + row_id * B_stride
+    C_row_ptr = C_ptr + row_id * C_stride
+
+    # Loop over blocks of columns
+    for col_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        # Load blocks from A and B
+        A_block = tl.load(A_row_ptr + col_offsets, mask=mask)
+        B_block = tl.load(B_row_ptr + col_offsets, mask=mask)
+
+        # Multiply and store into C
+        C_block = A_block * B_block
+        tl.store(C_row_ptr + col_offsets, C_block, mask=mask)

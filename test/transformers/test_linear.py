@@ -8,7 +8,7 @@ from liger_kernel.ops.linear import LigerLinearFunction
 from liger_kernel.transformers.functional import liger_linear
 from liger_kernel.transformers.linear import LigerLinear
 from liger_kernel.utils import infer_device
-s
+
 device = infer_device()
 
 set_seed(42)
@@ -32,7 +32,8 @@ class TorchLinearModel(torch.nn.Module):
     ):
         super().__init__()
         self.linear = torch.nn.Linear(
-            in_features=H, out_features=V, bias=bias, dtype=dtype, device=device)
+            in_features=H, out_features=V, bias=bias, dtype=dtype, device=device
+        )
 
     def forward(self, input_tensor):
         return self.linear(input_tensor)
@@ -48,15 +49,12 @@ class LigerLinearModel(torch.nn.Module):
         bias: bool = True,
     ):
         super().__init__()
-        self.weight = torch.nn.Parameter(
-            torch.empty(V, H, dtype=dtype, device=device))
+        self.weight = torch.nn.Parameter(torch.empty(V, H, dtype=dtype, device=device))
         if bias:
-            self.bias = torch.nn.Parameter(
-                torch.empty(V, dtype=dtype, device=device))
+            self.bias = torch.nn.Parameter(torch.empty(V, dtype=dtype, device=device))
         else:
             self.bias = None
 
-        self.reset_parameters()
         self.linear = LigerLinear()
 
     def forward(self, input_tensor):
@@ -104,11 +102,11 @@ def test_correctness(B, T, H, V, scalar, dtype, bias, atol, rtol):
     ).to(device)
 
     # init the linear layers with the same weights
-    torch_linear.linear.weight.data = liger_linear.linear.weight.data = torch.rand(
+    torch_linear.linear.weight.data = liger_linear.weight.data = torch.rand(
         V, H, device=device, dtype=dtype
     )
     if bias:
-        torch_linear.linear.bias.data = liger_linear.linear.bias.data = torch.rand(
+        torch_linear.linear.bias.data = liger_linear.bias.data = torch.rand(
             V, device=device, dtype=dtype
         )
 
@@ -129,7 +127,7 @@ def test_correctness(B, T, H, V, scalar, dtype, bias, atol, rtol):
 
     assert_verbose_allclose(
         torch_linear.linear.weight.grad,
-        liger_linear.linear.weight.grad,
+        liger_linear.weight.grad,
         atol=atol,
         rtol=rtol,
     )
@@ -137,7 +135,7 @@ def test_correctness(B, T, H, V, scalar, dtype, bias, atol, rtol):
     if bias:
         assert_verbose_allclose(
             torch_linear.linear.bias.grad,
-            liger_linear.linear.bias.grad,
+            liger_linear.bias.grad,
             atol=atol,
             rtol=rtol,
         )
@@ -229,9 +227,7 @@ def test_correctness_against_torch_linear(B, T, H, V, scalar, dtype, bias, atol,
     # Forward pass
     torch_output = torch_linear(input1)
     liger_output = LigerLinearFunction.apply(
-        input2,
-        torch_linear.weight,
-        torch_linear.bias
+        input2, torch_linear.weight, torch_linear.bias
     )
 
     assert_verbose_allclose(torch_output, liger_output, atol=atol, rtol=rtol)
@@ -278,10 +274,10 @@ def test_edge_cases(B, T, H, V, dtype, atol, rtol):
     ).to(device)
 
     # init the linear layers with the same weights
-    torch_linear.linear.weight.data = liger_linear.linear.weight.data = torch.rand(
+    torch_linear.linear.weight.data = liger_linear.weight.data = torch.rand(
         V, H, device=device, dtype=dtype
     )
-    torch_linear.linear.bias.data = liger_linear.linear.bias.data = torch.rand(
+    torch_linear.linear.bias.data = liger_linear.bias.data = torch.rand(
         V, device=device, dtype=dtype
     )
 
@@ -333,15 +329,14 @@ def test_amp(autocast_dtype, atol, rtol):
     ).to(device)
 
     # init the linear layers with the same weights
-    torch_linear.linear.weight.data = liger_linear.linear.weight.data = torch.rand(
+    torch_linear.linear.weight.data = liger_linear.weight.data = torch.rand(
         V, H, device=device, dtype=dtype
     )
-    torch_linear.linear.bias.data = liger_linear.linear.bias.data = torch.rand(
+    torch_linear.linear.bias.data = liger_linear.bias.data = torch.rand(
         V, device=device, dtype=dtype
     )
 
-    _tensor = torch.rand(B * T, H, device=device,
-                         dtype=autocast_dtype) * scalar
+    _tensor = torch.rand(B * T, H, device=device, dtype=autocast_dtype) * scalar
     _input1 = _tensor.detach().clone().requires_grad_(True)
     _input2 = _tensor.detach().clone().requires_grad_(True)
 
@@ -357,13 +352,13 @@ def test_amp(autocast_dtype, atol, rtol):
     assert_verbose_allclose(_input1.grad, _input2.grad, atol=atol, rtol=rtol)
     assert_verbose_allclose(
         torch_linear.linear.weight.grad,
-        liger_linear.linear.weight.grad,
+        liger_linear.weight.grad,
         atol=atol,
         rtol=rtol,
     )
     assert_verbose_allclose(
         torch_linear.linear.bias.grad,
-        liger_linear.linear.bias.grad,
+        liger_linear.bias.grad,
         atol=atol,
         rtol=rtol,
     )
@@ -383,14 +378,11 @@ def test_memory_efficiency(B, T, H, V, dtype, bias):
     # This is more of a smoke test - in practice you'd measure actual memory usage
     torch_linear = torch.nn.Linear(H, V, bias=bias, dtype=dtype, device=device)
 
-    input_tensor = torch.rand(B * T, H, device=device,
-                              dtype=dtype, requires_grad=True)
+    input_tensor = torch.rand(B * T, H, device=device, dtype=dtype, requires_grad=True)
 
     # Test that it runs without OOM
     output = LigerLinearFunction.apply(
-        input_tensor,
-        torch_linear.weight,
-        torch_linear.bias
+        input_tensor, torch_linear.weight, torch_linear.bias
     )
 
     # Test backward pass
@@ -408,15 +400,13 @@ def test_no_bias():
     dtype = torch.float32
 
     weight = torch.rand(V, H, device=device, dtype=dtype, requires_grad=True)
-    input_tensor = torch.rand(B * T, H, device=device,
-                              dtype=dtype, requires_grad=True)
+    input_tensor = torch.rand(B * T, H, device=device, dtype=dtype, requires_grad=True)
 
     # Test with None bias
     output = LigerLinearFunction.apply(input_tensor, weight, None)
 
     # Compare with torch linear without bias
-    torch_linear = torch.nn.Linear(
-        H, V, bias=False, dtype=dtype, device=device)
+    torch_linear = torch.nn.Linear(H, V, bias=False, dtype=dtype, device=device)
     torch_linear.weight.data = weight.data.clone()
 
     input_torch = input_tensor.detach().clone().requires_grad_(True)
@@ -429,8 +419,7 @@ def test_no_bias():
     output.backward(grad_output)
     torch_output.backward(grad_output)
 
-    assert_verbose_allclose(
-        input_tensor.grad, input_torch.grad, atol=1e-5, rtol=5e-4)
+    assert_verbose_allclose(input_tensor.grad, input_torch.grad, atol=1e-5, rtol=5e-4)
 
 
 if __name__ == "__main__":
