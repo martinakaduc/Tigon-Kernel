@@ -11,6 +11,9 @@ from liger_kernel.ops.utils import amp_custom_fwd
 # ------------------------------
 # Triton forward kernel: Conv2D Transpose (NCHW)
 # Weight layout: (C_in, C_out, K_h, K_w)
+# NOTES:
+# - Avoid 'break' / 'continue' inside tl.static_range (unsupported). Use masks.
+# - Avoid Python 'for range' with runtime bounds inside @triton.jit. Use 'while'.
 # ------------------------------
 
 @triton.jit
@@ -42,58 +45,97 @@ def _conv2d_transpose_fwd_kernel(
     n = pid_n // tiles_w
     tile_ow = pid_n % tiles_w
 
-    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)
-    offs_oh = pid_oh * BLOCK_OH + tl.arange(0, BLOCK_OH)
-    offs_ow = tile_ow * BLOCK_OW + tl.arange(0, BLOCK_OW)
+    offs_co = pid_co * BLOCK_CO + tl.arange(0, BLOCK_CO)         # [co]
+    offs_oh = pid_oh * BLOCK_OH + tl.arange(0, BLOCK_OH)         # [oh]
+    offs_ow = tile_ow * BLOCK_OW + tl.arange(0, BLOCK_OW)        # [ow]
 
     # accumulators
     acc = tl.zeros((BLOCK_CO, BLOCK_OH, BLOCK_OW), dtype=tl.float32)
 
-    for ci_base in range(0, C_in, BLOCK_CI):
-        ci_idxs = ci_base + tl.arange(0, BLOCK_CI)
+    # Reduce over input channels in BLOCK_CI chunks (use while for runtime upper bound)
+    ci_base = 0
+    while ci_base < C_in:
+        ci_idxs = ci_base + tl.arange(0, BLOCK_CI)               # [ci]
         ci_mask = ci_idxs < C_in
 
-        for kh in tl.static_range(0, 8):
-            if kh >= K_h:
-                break
+        # Unroll kh/kw with static_range; gate with masks (no break/continue)
+        for kh in tl.static_range(0, 8):                         # increase 8 if you need larger kernels
+            kh_valid = kh < K_h
             for kw in tl.static_range(0, 8):
-                if kw >= K_w:
-                    break
-                # Transpose relation
-                ih_num = (offs_oh[:, None] + pad_h - kh * dilation_h)
-                iw_num = (offs_ow[None, :] + pad_w - kw * dilation_w)
-                div_h_ok = (ih_num % stride_h) == 0
-                div_w_ok = (iw_num % stride_w) == 0
-                ih = ih_num // stride_h
-                iw = iw_num // stride_w
+                kw_valid = kw < K_w
+                do_work = kh_valid & kw_valid
+
+                # Transpose relation:
+                # oh + pad_h = ih * stride_h + kh * dilation_h  => ih = (oh + pad_h - kh*dil) / stride_h
+                ih_num = (offs_oh[:, None] + pad_h - kh * dilation_h)      # [OH, 1]
+                iw_num = (offs_ow[None, :] + pad_w - kw * dilation_w)      # [1, OW]
+
+                div_h_ok = (ih_num % stride_h) == 0                        # [OH, 1]
+                div_w_ok = (iw_num % stride_w) == 0                        # [1,  OW]
+
+                ih = ih_num // stride_h                                    # [OH, 1]
+                iw = iw_num // stride_w                                    # [1,  OW]
+
+                # --- NEW: flatten to 1-D to avoid creating 4-D tensors downstream
+                ih_flat = tl.reshape(ih, (BLOCK_OH,))                      # [OH]
+                iw_flat = tl.reshape(iw, (BLOCK_OW,))                      # [OW]
+
+                # Bounds/masks as [OH, OW]
                 in_bounds = (
-                    (ih >= 0) & (ih < H_in) &
-                    (iw >= 0) & (iw < W_in) &
+                    (ih_flat[:, None] >= 0) & (ih_flat[:, None] < H_in) &
+                    (iw_flat[None, :] >= 0) & (iw_flat[None, :] < W_in) &
                     div_h_ok & div_w_ok &
                     (offs_oh[:, None] < H_out) & (offs_ow[None, :] < W_out)
                 )
 
+                # ---- Loads ----
+                # Broadcast explicit 3-D index volumes: [CI, OH, OW]
+                ci_b = tl.broadcast_to(ci_idxs[:, None, None], (BLOCK_CI, BLOCK_OH, BLOCK_OW))
+                ih_b = tl.broadcast_to(ih_flat[None, :, None], (BLOCK_CI, BLOCK_OH, BLOCK_OW))
+                iw_b = tl.broadcast_to(iw_flat[None, None, :], (BLOCK_CI, BLOCK_OH, BLOCK_OW))
+
                 x_ptrs = (
                     x_ptr
                     + n * sxn
-                    + (ci_idxs[:, None, None] * sxc)
-                    + (ih[None, :, None] * sxh)
-                    + (iw[None, None, :] * sxw)
+                    + ci_b * sxc
+                    + ih_b * sxh
+                    + iw_b * sxw
                 )
-                x_vals = tl.load(x_ptrs, mask=ci_mask[:, None, None] & in_bounds[None, :, :], other=0.0)
+                ci_mask_b   = tl.broadcast_to(ci_mask[:, None, None], (BLOCK_CI, BLOCK_OH, BLOCK_OW))
+                in_bounds_b = tl.broadcast_to(in_bounds[None, :, :],   (BLOCK_CI, BLOCK_OH, BLOCK_OW))
 
+                x_vals = tl.load(
+                    x_ptrs,
+                    mask=(ci_mask_b & in_bounds_b),
+                    other=0.0,
+                )
+
+
+                # Load W[ci, co, kh, kw] -> (BLOCK_CI, BLOCK_CO)
                 w_ptrs = (
                     w_ptr
-                    + (ci_idxs[:, None] * swn)
-                    + (offs_co[None, :] * swc)
+                    + (ci_idxs[:, None] * swn)          # stride over Cin
+                    + (offs_co[None, :] * swc)          # stride over Cout
                     + kh * swh + kw * sww
                 )
-                w_vals = tl.load(w_ptrs, mask=ci_mask[:, None] & (offs_co[None, :] < C_out), other=0.0)
+                w_vals = tl.load(
+                    w_ptrs,
+                    mask=do_work & (ci_mask[:, None] & (offs_co[None, :] < C_out)),
+                    other=0.0,
+                )
 
-                x_mat = tl.reshape(x_vals, (BLOCK_CI, BLOCK_OH * BLOCK_OW))
-                prod = tl.dot(w_vals.T, x_mat)  # (BLOCK_CO, BLOCK_OH*BLOCK_OW)
+                # MAC: for each (oh, ow): sum_ci x * w
+                x_mat = tl.reshape(x_vals, (BLOCK_CI, BLOCK_OH * BLOCK_OW))   # (Ci, OH*OW)
+                prod = tl.dot(w_vals.T, x_mat)                                # (CO, OH*OW)
                 acc += tl.reshape(prod, (BLOCK_CO, BLOCK_OH, BLOCK_OW))
 
+            # end kw
+        # end kh
+
+        ci_base += BLOCK_CI
+    # end while Cin
+
+    # Store Y[n, co, oh, ow]
     y_ptrs = (
         y_ptr
         + n * syn
@@ -160,7 +202,7 @@ def conv2d_transpose_forward(
     # Output tensor
     output = torch.empty((N, Cout, Hout, Wout), dtype=dtype, device=device)
 
-    # Launch Triton over tiles; keep it simple and stream over batch & width
+    # Strides in elements
     sxn, sxc, sxh, sxw = input_tensor.stride()
     swn, swc, swh, sww = weight.stride()
     syn, syc, syh, syw = output.stride()
@@ -208,54 +250,59 @@ def conv2d_transpose_backward(
     dilation: Tuple[int, int],
     output_padding: Tuple[int, int],
 ):
-    # Use PyTorch's efficient gradient helpers for correctness and simplicity.
-    # (You can replace with Triton kernels later if you need fully custom backward.)
-    N, Cin, Hin, Win = input_tensor.shape
+    import torch.nn.functional as F
 
-    # grad_input
-    if grad_input is not None:
-        grad_input.copy_(
-            torch.nn.grad.conv_transpose2d_input(
-                input_size=input_tensor.shape,
-                weight=weight,
-                grad_output=grad_output,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=1,
-                output_padding=output_padding,
-            )
+    need_x = grad_input is not None
+    need_w = grad_weight is not None
+    need_b = (grad_bias is not None) and (bias is not None)
+
+    # Create differentiable clones only for the grads we need
+    x_tmp = input_tensor.detach().requires_grad_(need_x)
+    w_tmp = weight.detach().requires_grad_(need_w)
+    b_tmp = bias.detach().requires_grad_(need_b) if need_b else None
+
+    with torch.enable_grad():
+        y_tmp = F.conv_transpose2d(
+            x_tmp, w_tmp, b_tmp,
+            stride=stride, padding=padding, dilation=dilation, output_padding=output_padding,
         )
 
-    # grad_weight
-    if grad_weight is not None:
-        grad_weight.copy_(
-            torch.nn.grad.conv_transpose2d_weight(
-                input=input_tensor,
-                weight_size=weight.shape,
-                grad_output=grad_output,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=1,
-                output_padding=output_padding,
-            )
+        inputs = []
+        if need_x: inputs.append(x_tmp)
+        if need_w: inputs.append(w_tmp)
+        if need_b: inputs.append(b_tmp)
+
+        grads = torch.autograd.grad(
+            outputs=y_tmp,
+            inputs=inputs,
+            grad_outputs=grad_output,
+            retain_graph=False,
+            create_graph=False,
+            allow_unused=True,
         )
 
-    # grad_bias
-    if grad_bias is not None:
-        grad_bias.add_(grad_output.sum(dim=(0, 2, 3)))
+    # Unpack grads in the same order we appended to `inputs`
+    idx = 0
+    if need_x:
+        gx = grads[idx]; idx += 1
+        grad_input.copy_(gx if gx is not None else torch.zeros_like(input_tensor))
+    if need_w:
+        gw = grads[idx]; idx += 1
+        grad_weight.copy_(gw if gw is not None else torch.zeros_like(weight))
+    if need_b:
+        gb = grads[idx]
+        grad_bias.copy_(gb if gb is not None else torch.zeros_like(bias))
+    elif grad_bias is not None:
+        # If bias grad buffer exists but no bias param was provided, zero it.
+        grad_bias.zero_()
 
     return grad_input, grad_weight, grad_bias
 
 
-class LigerConvTranspose2dFunction(torch.autograd.Function):
-    """
-    Conv2D Transpose implementation
 
-    Mirrors the coding pattern of the provided Linear example:
-    - forward(): Triton tiled kernel with bias add; returns (output, grad buffers, saved tensors)
-    - backward(): uses torch gradient helpers, returns grads matching inputs
+class LigerConv2dTransposeFunction(torch.autograd.Function):
+    """
+    Conv2D Transpose implementation in the same coding style as LigerLinearFunction.
     """
 
     @staticmethod
@@ -274,7 +321,7 @@ class LigerConvTranspose2dFunction(torch.autograd.Function):
             input_tensor, weight, bias, stride, padding, dilation, output_padding
         )
 
-        # Save for backward
+        # Save tensors for backward pass
         ctx.save_for_backward(
             saved_input,
             weight,
@@ -318,7 +365,6 @@ class LigerConvTranspose2dFunction(torch.autograd.Function):
             ctx.output_padding,
         )
 
-        # Return grads in the order of forward's inputs
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
@@ -343,7 +389,7 @@ def conv2d_transpose(
     Returns:
         torch.Tensor: output tensor with shape (N, Cout, Hout, Wout)
     """
-    return LigerConvTranspose2dFunction.apply(
+    return LigerConv2dTransposeFunction.apply(
         input_tensor, weight, bias, stride, padding, dilation, output_padding
     )
 

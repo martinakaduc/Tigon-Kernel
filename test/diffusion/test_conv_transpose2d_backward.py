@@ -6,39 +6,56 @@ from liger_kernel.ops.conv2d_transpose import conv2d_transpose  # noqa: F401
 # from liger_kernel.ops.conv2d_transpose_triton import conv2d_transpose
 
 
-def run_case(N, Cin, Cout, Hin, Win, Kh, Kw, stride, padding, dilation=(1,1), output_padding=(0,0), dtype=torch.float16):
+def run_case(N, Cin, Cout, Hin, Win, Kh, Kw, stride, padding,
+             dilation=(1,1), output_padding=(0,0), dtype=torch.float16):
     print(f"\n=== Backward Test Case ===")
-    print(f"N={N}, Cin={Cin}, Cout={Cout}, H={Hin}, W={Win}, Kh={Kh}, Kw={Kw}, stride={stride}, padding={padding}, dilation={dilation}, output_padding={output_padding}")
+    print(f"N={N}, Cin={Cin}, Cout={Cout}, H={Hin}, W={Win}, Kh={Kh}, Kw={Kw}, "
+          f"stride={stride}, padding={padding}, dilation={dilation}, output_padding={output_padding}")
 
-    # Reference autograd (PyTorch)
-    x_ref = torch.randn(N, Cin, Hin, Win, device="cuda", dtype=dtype, requires_grad=False)
+    atol = 1e-3 if dtype == torch.float16 else 1e-4
+    rtol = 1e-3
+
+    # ----- Reference (PyTorch autograd) -----
+    x_ref = torch.randn(N, Cin, Hin, Win, device="cuda", dtype=dtype, requires_grad=True)
     w_ref = torch.randn(Cin, Cout, Kh, Kw, device="cuda", dtype=dtype, requires_grad=True)
     b_ref = torch.randn(Cout, device="cuda", dtype=dtype, requires_grad=True)
 
-    y_ref = torch.nn.functional.conv_transpose2d(x_ref, w_ref, b_ref, stride=stride, padding=padding, dilation=dilation, output_padding=output_padding)
-    y_ref.sum().backward()
+    y_ref = torch.nn.functional.conv_transpose2d(
+        x_ref, w_ref, b_ref,
+        stride=stride, padding=padding, dilation=dilation, output_padding=output_padding
+    )
+    loss_ref = y_ref.sum()
+    loss_ref.backward()
+    dx_ref = x_ref.grad.detach().clone()
     dw_ref = w_ref.grad.detach().clone()
     db_ref = b_ref.grad.detach().clone()
-    dx_ref = torch.autograd.grad(outputs=[y_ref], inputs=[x_ref], grad_outputs=[torch.ones_like(y_ref)], retain_graph=False, allow_unused=True)[0]
 
-    # Triton op under autograd (our Function provides backward via torch.grad helpers)
-    x = x_ref.detach().clone().requires_grad_(False)
+    # ----- Triton op under autograd (our Function has a backward) -----
+    x = x_ref.detach().clone().requires_grad_(True)
     w = w_ref.detach().clone().requires_grad_(True)
     b = b_ref.detach().clone().requires_grad_(True)
 
-    y = conv2d_transpose(x, w, b, stride=stride, padding=padding, dilation=dilation, output_padding=output_padding)
+    y = conv2d_transpose(
+        x, w, b,
+        stride=stride, padding=padding, dilation=dilation, output_padding=output_padding
+    )
     loss = y.sum()
     loss.backward()
 
+    dx = x.grad.detach().clone()
     dw = w.grad.detach().clone()
     db = b.grad.detach().clone()
 
-    # Compare weights & bias grads
+    # ----- Compare -----
+    max_diff_x = (dx - dx_ref).abs().max().item()
     max_diff_w = (dw - dw_ref).abs().max().item()
     max_diff_b = (db - db_ref).abs().max().item()
-    ok_w = torch.allclose(dw, dw_ref, atol=1e-3 if dtype==torch.float16 else 1e-4, rtol=1e-3)
-    ok_b = torch.allclose(db, db_ref, atol=1e-3 if dtype==torch.float16 else 1e-4, rtol=1e-3)
 
+    ok_x = torch.allclose(dx, dx_ref, atol=atol, rtol=rtol)
+    ok_w = torch.allclose(dw, dw_ref, atol=atol, rtol=rtol)
+    ok_b = torch.allclose(db, db_ref, atol=atol, rtol=rtol)
+
+    print("dx.shape        =", tuple(dx.shape), "ref:", tuple(dx_ref.shape), "max diff:", max_diff_x, "ok:", ok_x)
     print("dw.shape        =", tuple(dw.shape), "ref:", tuple(dw_ref.shape), "max diff:", max_diff_w, "ok:", ok_w)
     print("db.shape        =", tuple(db.shape), "ref:", tuple(db_ref.shape), "max diff:", max_diff_b, "ok:", ok_b)
 
