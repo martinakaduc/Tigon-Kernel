@@ -5,8 +5,8 @@ from test.utils import assert_verbose_allclose
 from test.utils import set_seed
 
 from liger_kernel.ops.linear import LigerLinearFunction
-from liger_kernel.transformers.functional import liger_linear
-from liger_kernel.transformers.linear import LigerLinear
+from liger_kernel.diffusers.functional import liger_linear
+from liger_kernel.diffusers.linear import LigerLinear
 from liger_kernel.utils import infer_device
 
 device = infer_device()

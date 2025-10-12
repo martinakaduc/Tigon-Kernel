@@ -5,8 +5,8 @@ from test.utils import assert_verbose_allclose
 from test.utils import set_seed
 from test.utils import supports_bfloat16
 
-from liger_kernel.transformers.functional import liger_mse
-from liger_kernel.transformers.mse import LigerMSE
+from liger_kernel.diffusers.functional import liger_mse
+from liger_kernel.diffusers.mse import LigerMSE
 from liger_kernel.utils import infer_device
 
 device = infer_device()
