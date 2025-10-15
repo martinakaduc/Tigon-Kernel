@@ -5,6 +5,7 @@ from liger_kernel.ops.dyt import LigerDyTFunction
 from liger_kernel.ops.fused_add_rms_norm import LigerFusedAddRMSNormFunction
 from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
 from liger_kernel.ops.fused_linear_jsd import LigerFusedLinearJSDFunction
+from liger_kernel.ops.fused_linear_mse import LigerFusedLinearMSEFunction
 from liger_kernel.ops.fused_neighborhood_attention import LigerFusedNeighborhoodAttentionFunction
 from liger_kernel.ops.geglu import LigerGELUMulFunction
 from liger_kernel.ops.group_norm import LigerGroupNormFunction
@@ -106,6 +107,42 @@ def liger_fused_linear_jsd(
         jsd_beta,
         ignore_index,
         temperature,
+    )
+
+
+def liger_fused_linear_mse(
+    input,
+    weight,
+    target,
+    bias=None,
+    reduction: str = "mean",
+    accum_dtype=None,
+):
+    """
+    Fused linear layer with MSE loss.
+    
+    This function combines a linear transformation with MSE loss computation,
+    avoiding the materialization of large intermediate logits tensors.
+    
+    Args:
+        input: Input tensor of shape (batch_size * seq_len, hidden_size)
+        weight: Weight tensor of shape (output_size, hidden_size)
+        target: Target tensor of shape (batch_size * seq_len, output_size) 
+               or (batch_size * seq_len,) for class indices
+        bias: Optional bias tensor of shape (output_size,)
+        reduction: Reduction type ('mean', 'sum', 'none'). Default: 'mean'
+        accum_dtype: Optional dtype for gradient accumulation. Default: None
+    
+    Returns:
+        torch.Tensor: MSE loss
+    """
+    return LigerFusedLinearMSEFunction.apply(
+        input,
+        weight,
+        target,
+        bias,
+        reduction,
+        accum_dtype,
     )
 
 
