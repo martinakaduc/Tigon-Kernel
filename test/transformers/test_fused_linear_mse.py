@@ -4,7 +4,9 @@ import torch.nn.functional as F
 from liger_kernel.ops.fused_linear_mse import LigerFusedLinearMSEFunction
 from liger_kernel.transformers.fused_linear_mse import LigerFusedLinearMSE
 from liger_kernel.transformers.functional import liger_fused_linear_mse
+from liger_kernel.utils import infer_device
 
+device = infer_device()
 
 def test_fused_linear_mse_basic():
     """Test basic functionality of fused linear MSE."""
@@ -17,11 +19,11 @@ def test_fused_linear_mse_basic():
     output_size = 32
     
     # Create test data
-    input_tensor = torch.randn(batch_size * seq_len, hidden_size, requires_grad=True)
-    weight = torch.randn(output_size, hidden_size, requires_grad=True)
-    bias = torch.randn(output_size, requires_grad=True)
-    target = torch.randn(batch_size * seq_len, output_size)
-    
+    input_tensor = torch.randn(batch_size * seq_len, hidden_size, requires_grad=True, device=device)
+    weight = torch.randn(output_size, hidden_size, requires_grad=True, device=device)
+    bias = torch.randn(output_size, requires_grad=True, device=device)
+    target = torch.randn(batch_size * seq_len, output_size, device=device)
+
     # Test the autograd function directly
     print("Testing LigerFusedLinearMSEFunction...")
     loss_fused = LigerFusedLinearMSEFunction.apply(
@@ -85,10 +87,10 @@ def test_fused_linear_mse_reductions():
     hidden_size = 8
     output_size = 16
     
-    input_tensor = torch.randn(batch_size * seq_len, hidden_size)
-    weight = torch.randn(output_size, hidden_size)
-    target = torch.randn(batch_size * seq_len, output_size)
-    
+    input_tensor = torch.randn(batch_size * seq_len, hidden_size, device=device)
+    weight = torch.randn(output_size, hidden_size, device=device)
+    target = torch.randn(batch_size * seq_len, output_size, device=device)
+
     print("Testing different reduction modes...")
     
     for reduction in ["mean", "sum", "none"]:
@@ -130,17 +132,17 @@ def test_fused_linear_mse_shapes():
     for batch_seq, hidden, output in configs:
         print(f"\nTesting shape ({batch_seq}, {hidden}) -> ({output})")
         
-        input_tensor = torch.randn(batch_seq, hidden)
-        weight = torch.randn(output, hidden)
-        target = torch.randn(batch_seq, output)
-        
+        input_tensor = torch.randn(batch_seq, hidden, device=device)
+        weight = torch.randn(output, hidden, device=device)
+        target = torch.randn(batch_seq, output, device=device)
+
         # Test without bias
         loss_no_bias = LigerFusedLinearMSEFunction.apply(
             input_tensor, weight, target, None, "mean", None
         )
         
         # Test with bias
-        bias = torch.randn(output)
+        bias = torch.randn(output, device=device)
         loss_with_bias = LigerFusedLinearMSEFunction.apply(
             input_tensor, weight, target, bias, "mean", None
         )
