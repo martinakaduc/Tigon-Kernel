@@ -31,13 +31,6 @@ def linear_forward(
     # (BT + chunk_size - 1) // chunk_size
     num_chunks = triton.cdiv(BT, chunk_size)
 
-    # Initialize gradients if needed
-    grad_weight = torch.zeros_like(
-        weight, device=device) if weight.requires_grad else None
-    grad_bias = torch.zeros_like(
-        bias, device=device) if bias is not None and bias.requires_grad else None
-    grad_input = torch.zeros_like(input_tensor)
-
     # Initialize output tensor
     output = torch.zeros((BT, V), dtype=dtype, device=device)
 
@@ -61,21 +54,33 @@ def linear_forward(
         if weight.requires_grad:
             # grad_weight += input_chunk.t() @ grad_output_chunk
             # We'll store the input chunks for backward pass
+            # nothing to do here in the forward pass; gradients will be
+            # computed in the backward pass in a chunked manner
             pass
 
-    return output, grad_input, grad_weight, grad_bias, input_tensor
+    # Return only the output and the original input for saving in ctx.
+    # Gradients will be allocated and computed during backward.
+    return output, input_tensor
 
 
-def linear_backward(grad_output, input_tensor, weight, bias, grad_input, grad_weight, grad_bias):
-    device = input_tensor.device
-    dtype = input_tensor.dtype
-
+def linear_backward(grad_output, input_tensor, weight, bias):
     BT, H = input_tensor.shape
     V = weight.shape[0]
 
     inc_factor = triton.cdiv(V, H)
     chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))
     num_chunks = triton.cdiv(BT, chunk_size)
+
+    # Allocate gradients
+    grad_input = torch.zeros_like(input_tensor)
+    grad_weight = (
+        torch.zeros_like(weight, device=weight.device) if weight.requires_grad else None
+    )
+    grad_bias = (
+        torch.zeros_like(bias, device=bias.device)
+        if bias is not None and bias.requires_grad
+        else None
+    )
 
     # Process chunks for backward pass
     for chunk_id in range(num_chunks):
@@ -90,7 +95,7 @@ def linear_backward(grad_output, input_tensor, weight, bias, grad_input, grad_we
         grad_input_chunk = grad_output_chunk @ weight
         grad_input[start_idx:end_idx] = grad_input_chunk
 
-        # Gradient w.r.t weight: grad_weight += input.t() @ grad_output
+        # Gradient w.r.t weight: grad_weight += grad_output^T @ input
         if grad_weight is not None:
             grad_weight.add_(grad_output_chunk.t() @ input_chunk)
 
@@ -119,7 +124,7 @@ class LigerLinearFunction(torch.autograd.Function):
     ):
         """
         Args:
-            input_tensor (torch.Tensor): input tensor with shape (B*T, H), where B is batch size, 
+            input_tensor (torch.Tensor): input tensor with shape (B*T, H), where B is batch size,
                                        T is sequence length, H is hidden dimension.
             weight (torch.Tensor): weight matrix with shape (V, H), where V is output dimension
             bias (Optional[torch.Tensor]): bias vector with shape (V,). Default: None
@@ -128,50 +133,54 @@ class LigerLinearFunction(torch.autograd.Function):
             output (torch.Tensor): output tensor with shape (B*T, V)
         """
 
-        output, grad_input, grad_weight, grad_bias, saved_input = linear_forward(
-            input_tensor,
-            weight,
-            bias,
-        )
+        output, saved_input = linear_forward(input_tensor, weight, bias)
 
-        # Save tensors for backward pass
-        ctx.save_for_backward(
-            saved_input,
-            weight,
-            bias,
-            grad_input.detach(),
-            grad_weight.detach() if grad_weight is not None else None,
-            grad_bias.detach() if grad_bias is not None else None,
-        )
+        # Save only tensors (no None values) for backward. If bias is None,
+        # don't pass it to save_for_backward (save_for_backward doesn't accept None).
+        if bias is None:
+            ctx.save_for_backward(saved_input, weight)
+        else:
+            ctx.save_for_backward(saved_input, weight, bias)
 
         return output
 
     @staticmethod
     @amp_custom_bwd
-    def backward(ctx, grad_output):
-        (
-            input_tensor,
-            weight,
-            bias,
-            grad_input,
-            grad_weight,
-            grad_bias,
-        ) = ctx.saved_tensors
+    def backward(ctx, *grad_outputs):
+        # autograd may pass gradients for each output; we only have one output
+        if len(grad_outputs) == 0:
+            raise RuntimeError("No grad_output provided to backward")
+
+        grad_output = grad_outputs[0]
+
+        saved = ctx.saved_tensors
+
+        # saved can be (input, weight) or (input, weight, bias)
+        if len(saved) == 2:
+            input_tensor, weight = saved
+            bias = None
+        else:
+            input_tensor, weight, bias = saved
 
         grad_input, grad_weight, grad_bias = linear_backward(
-            grad_output, input_tensor, weight, bias, grad_input, grad_weight, grad_bias
+            grad_output, input_tensor, weight, bias
         )
 
+        # Return gradients corresponding to forward inputs: input, weight, bias
         return grad_input, grad_weight, grad_bias
 
 
-def linear(input_tensor: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
+def linear(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+):
     """
     Memory-efficient linear layer
 
     Args:
         input_tensor (torch.Tensor): input tensor with shape (B*T, H)
-        weight (torch.Tensor): weight matrix with shape (V, H) 
+        weight (torch.Tensor): weight matrix with shape (V, H)
         bias (Optional[torch.Tensor]): bias vector with shape (V,)
 
     Returns:
