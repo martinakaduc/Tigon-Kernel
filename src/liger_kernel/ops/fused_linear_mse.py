@@ -65,9 +65,10 @@ def liger_fused_linear_mse_kernel(
         # Compute difference and squared difference
         diff = x_vals - y_vals
         squared_diff = diff * diff
+        masked_squared_diff = tl.where(mask, squared_diff, 0.0)
 
         # Accumulate loss for reduction
-        loss_sum += tl.sum(tl.where(mask, squared_diff, 0.0))
+        loss_sum += tl.sum(masked_squared_diff)
 
         # Compute gradient: d_loss/d_logits = 2 * (logits - target)
         # We'll apply the reduction factor later in the calling function
@@ -75,16 +76,18 @@ def liger_fused_linear_mse_kernel(
 
         # Store gradient back to X_ptr (in-place gradient computation)
         tl.store(X_ptr + offsets, grad, mask=mask)
+        
+        # Store per-element loss if reduction == 'none'
+        if reduction == "none":
+            tl.store(loss_ptr + offsets, masked_squared_diff, mask=mask)
 
-    # Store the loss
+    # Handle scalar reductions
     if reduction == "mean":
         loss = loss_sum / n_cols
+        tl.store(loss_ptr, loss)
     elif reduction == "sum":
         loss = loss_sum
-    else:  # reduction == "none"
-        loss = loss_sum / n_cols  # Per-sample loss
-
-    tl.store(loss_ptr, loss)
+        tl.store(loss_ptr, loss)
 
 
 def fused_linear_mse_forward(
@@ -158,7 +161,11 @@ def fused_linear_mse_forward(
             else None
         )
 
-    loss_1d = torch.zeros(BT, dtype=torch.float32, device=device)
+    # Allocate loss tensor based on reduction type
+    if reduction == "none":
+        loss_output = torch.zeros(BT, V, dtype=torch.float32, device=device)
+    else:
+        loss_output = torch.zeros(BT, dtype=torch.float32, device=device)
 
     # Process in chunks to manage memory
     for chunk_id in range(num_chunks):
@@ -175,11 +182,15 @@ def fused_linear_mse_forward(
         n_rows = logits_chunk.shape[0]
 
         # Prepare loss storage for this chunk
-        loss_1d_slice = loss_1d[start_idx:end_idx]  # chunk_size,
+        if reduction == "none":
+            loss_slice = loss_output[start_idx:end_idx]  # chunk_size x V
+        else:
+            loss_slice = loss_output[start_idx:end_idx]  # chunk_size,
 
         # Ensure tensors are contiguous
         logits_chunk = logits_chunk.contiguous()
         target_chunk = target_chunk.contiguous()
+        loss_slice = loss_slice.contiguous()
 
         # Run the fused kernel - computes both loss and gradients in-place
         liger_fused_linear_mse_kernel[(n_rows,)](
@@ -187,8 +198,8 @@ def fused_linear_mse_forward(
             X_stride=logits_chunk.stride(-2),
             Y_ptr=target_chunk,
             Y_stride=target_chunk.stride(-2),
-            loss_ptr=loss_1d_slice,
-            loss_stride=loss_1d_slice.stride(-1),  # always 1
+            loss_ptr=loss_slice,
+            loss_stride=loss_slice.stride(-2) if reduction == "none" else loss_slice.stride(-1),
             n_cols=V,
             reduction=reduction,
             BLOCK_SIZE=BLOCK_SIZE,
@@ -230,11 +241,11 @@ def fused_linear_mse_forward(
 
     # Compute final loss
     if reduction == "none":
-        loss = loss_1d
+        loss = loss_output
     elif reduction == "mean":
-        loss = torch.mean(loss_1d)
+        loss = torch.mean(loss_output)
     elif reduction == "sum":
-        loss = torch.sum(loss_1d)
+        loss = torch.sum(loss_output)
     else:
         raise ValueError(f"Unsupported reduction: {reduction}")
 
